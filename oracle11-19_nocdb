@@ -1,0 +1,209 @@
+#!/bin/bash
+# Oracle一键安装脚本（支持11g/19c离线安装）
+
+# ---------------------- 全局配置 ----------------------
+set -euo pipefail
+LOG_FILE="/var/log/oracle_install.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# ---------------------- 参数配置 ----------------------
+ORACLE_VERSION=${1:-19}             # 默认安装19c
+ORACLE_BASE="/u01/app/oracle"       # 基础目录
+ORACLE_HOME="${ORACLE_BASE}/product/${ORACLE_VERSION}.0/dbhome_1"  # 安装目录
+LOCAL_PKG_DIR="/soft"               # 本地安装包存放目录
+ORACLE_PASSWORD="Oracle123!"        # 数据库密码
+# 获取当前所在目录位置
+current_dir=$(pwd)
+echo "当前所在目录位置: $current_dir"
+# 目标路径
+target_dir="/soft"
+# 检查目标路径是否存在，如果不存在则创建
+if [ ! -d "$target_dir" ]; then
+    mkdir -p "$target_dir"
+    echo "已创建目录: $target_dir"
+fi
+# 移动当前目录下的所有文件到目标路径
+mv $current_dir/* $target_dir
+echo "已将当前目录下所有文件移动至 $target_dir"
+cd /soft
+tar -xvf oracle_repo.tar.gz
+cd /soft/my_oracle_repo
+rpm -ivh *.rpm --nodeps --force
+# ---------------------- 初始化检查 ----------------------
+# 检查root权限
+[ "$(id -u)" != "0" ] && echo "必须使用root用户执行" && exit 1
+
+# 检查本地安装包
+check_local_packages() {
+  case ${ORACLE_VERSION} in
+    11)
+      if [ ! -f "${LOCAL_PKG_DIR}/linux.x64_11gR2_database_1of2.zip" ] || \
+         [ ! -f "${LOCAL_PKG_DIR}/linux.x64_11gR2_database_2of2.zip" ]; then
+        echo "错误：缺少11g安装包文件"
+        exit 1
+      fi
+      ;;
+    19)
+      if [ ! -f "${LOCAL_PKG_DIR}/LINUX.X64_193000_db_home.zip" ]; then
+        echo "错误：缺少19c安装包文件"
+        exit 1
+      fi
+      ;;
+    *)
+      echo "不支持的版本：${ORACLE_VERSION}"
+      exit 1
+      ;;
+  esac
+}
+
+# ---------------------- 系统配置 ----------------------
+configure_system() {
+  # 修改主机名
+  hostnamectl set-hostname oracle-db
+
+  # 关闭SELinux
+  sed -i 's/SELINUX=enforcing/SELINUX=disabled/' /etc/selinux/config
+  setenforce 0
+
+  # 关闭防火墙
+  systemctl stop firewalld
+  systemctl disable firewalld
+
+  # 创建目录结构
+  mkdir -p ${ORACLE_BASE} ${ORACLE_HOME} /u01/app/oraInventory ${LOCAL_PKG_DIR}
+  chown -R oracle:oinstall /u01
+  chmod -R 775 /u01
+}
+
+# ---------------------- 安装依赖 ----------------------
+
+# ---------------------- 用户配置 ----------------------
+setup_users() {
+  if ! id oracle &>/dev/null; then
+    groupadd -g 54321 oinstall
+    groupadd -g 54322 dba
+    useradd -u 54321 -g oinstall -G dba oracle
+    echo "oracle:${ORACLE_PASSWORD}" | chpasswd
+  fi
+
+  # 配置环境变量
+  cat <<EOF >/home/oracle/.bash_profile
+export ORACLE_BASE=${ORACLE_BASE}
+export ORACLE_HOME=${ORACLE_HOME}
+export ORACLE_SID=orcl
+export PATH=\$PATH:\${ORACLE_HOME}/bin
+export LD_LIBRARY_PATH=\${ORACLE_HOME}/lib:/lib:/usr/lib
+export CLASSPATH=\${ORACLE_HOME}/jlib:\${ORACLE_HOME}/rdbms/jlib
+EOF
+}
+
+# ---------------------- 内核优化 ----------------------
+optimize_kernel() {
+  # 内存计算（单位：KB）
+  MEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+  SHMMAX=$((MEM_KB * 75 / 100))
+  SHMALL=$((MEM_KB * 80 / 100 / 4096))
+
+  cat <<EOF >/etc/sysctl.d/99-oracle.conf
+fs.aio-max-nr = 1048576
+fs.file-max = 6815744
+kernel.shmall = ${SHMALL}
+kernel.shmmax = ${SHMMAX}
+kernel.shmmni = 4096
+kernel.sem = 250 32000 100 128
+net.ipv4.ip_local_port_range = 9000 65500
+net.core.rmem_default = 262144
+net.core.rmem_max = 4194304
+net.core.wmem_default = 262144
+net.core.wmem_max = 1048576
+EOF
+  sysctl -p /etc/sysctl.d/99-oracle.conf
+
+  # 用户限制配置
+  cat <<EOF >/etc/security/limits.d/oracle.conf
+oracle soft nofile 65536
+oracle hard nofile 65536
+oracle soft nproc 16384
+oracle hard nproc 16384
+oracle soft stack 10240
+oracle hard stack 32768
+EOF
+}
+
+# ---------------------- 数据库安装 ----------------------
+install_oracle() {
+  # 解压本地安装包
+  case ${ORACLE_VERSION} in
+    11)
+      unzip "${LOCAL_PKG_DIR}/linux.x64_11gR2_database_1of2.zip" -d ${LOCAL_PKG_DIR}
+      unzip "${LOCAL_PKG_DIR}/linux.x64_11gR2_database_2of2.zip" -d ${LOCAL_PKG_DIR}
+      INSTALL_DIR="${LOCAL_PKG_DIR}/database"
+      ;;
+    19)
+      unzip "${LOCAL_PKG_DIR}/LINUX.X64_193000_db_home.zip" -d ${ORACLE_HOME}
+      INSTALL_DIR="${ORACLE_HOME}"
+      ;;
+  esac
+
+  # 生成响应文件
+  cat <<EOF >${LOCAL_PKG_DIR}/db_install.rsp
+oracle.install.responseFileVersion=/oracle/install/rspfmt_dbinstall_response_schema_v${ORACLE_VERSION}.0
+oracle.install.option=INSTALL_DB_SWONLY
+UNIX_GROUP_NAME=oinstall
+INVENTORY_LOCATION=/u01/app/oraInventory
+ORACLE_HOME=${ORACLE_HOME}
+ORACLE_BASE=${ORACLE_BASE}
+oracle.install.db.InstallEdition=EE
+oracle.install.db.OSDBA_GROUP=dba
+oracle.install.db.OSOPER_GROUP=dba
+EOF
+
+  # 执行安装
+  su - oracle -c "${INSTALL_DIR}/runInstaller -silent -responseFile ${LOCAL_PKG_DIR}/db_install.rsp"
+  sleep 300
+
+  # 执行root脚本
+  ${ORACLE_HOME}/root.sh
+}
+
+# ---------------------- 数据库配置 ----------------------
+configure_database() {
+  # 配置监听器
+  su - oracle -c "netca -silent -responseFile ${ORACLE_HOME}/assistants/netca/netca.rsp"
+
+  # 创建数据库
+  cat <<EOF >${LOCAL_PKG_DIR}/dbca.rsp
+responseFileVersion=/oracle/assistants/rspfmt_dbca_response_schema_v${ORACLE_VERSION}.0
+gdbName=orcl
+sid=orcl
+templateName=General_Purpose.dbc
+sysPassword=${ORACLE_PASSWORD}
+systemPassword=${ORACLE_PASSWORD}
+characterSet=AL32UTF8
+memoryPercentage=40
+databaseType=MULTIPURPOSE
+automaticMemoryManagement=false
+EOF
+
+  su - oracle -c "dbca -silent -createDatabase -responseFile ${LOCAL_PKG_DIR}/dbca.rsp"
+}
+
+# ---------------------- 主流程 ----------------------
+main() {
+  echo "====== 开始Oracle安装流程 ======"
+  check_local_packages
+  configure_system
+  setup_users
+  optimize_kernel
+  install_oracle
+  configure_database
+  echo "====== Oracle安装成功完成 ======"
+  echo "连接信息："
+  echo "  主机: $(hostname -I | awk '{print $1}')"
+  echo "  端口: 1521"
+  echo "  SID: orcl"
+  echo "  系统用户: oracle/${ORACLE_PASSWORD}"
+  echo "  SYS密码: ${ORACLE_PASSWORD}"
+}
+
+main
